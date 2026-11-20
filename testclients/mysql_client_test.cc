@@ -24261,6 +24261,300 @@ static void test_bug36686351() {
   mysql_stmt_close(stmt);
 }
 
+/* WL#17356: DELETE RETURNING binary prepare and cursor rejection. */
+static void test_delete_returning_binary_prepare() {
+  myheader("test_delete_returning_binary_prepare");
+  int rc;
+
+  myquery(mysql_query(mysql,
+                      "CREATE TABLE delete_returning_ps (id INT PRIMARY KEY)"));
+  myquery(
+      mysql_query(mysql, "INSERT INTO delete_returning_ps VALUES (1), (2)"));
+
+  const char *query =
+      "DELETE FROM delete_returning_ps WHERE id = ? RETURNING id";
+  MYSQL_STMT *stmt = mysql_stmt_init(mysql);
+  DIE_UNLESS(stmt != nullptr);
+  rc = mysql_stmt_prepare(stmt, query, strlen(query));
+  check_execute(stmt, rc);
+
+  DIE_UNLESS(mysql_stmt_field_count(stmt) == 1);
+  MYSQL_RES *metadata = mysql_stmt_result_metadata(stmt);
+  DIE_UNLESS(metadata != nullptr);
+  DIE_UNLESS(mysql_num_fields(metadata) == 1);
+  mysql_free_result(metadata);
+
+  int id = 1;
+  int returned_id = 0;
+  MYSQL_BIND param{};
+  param.buffer_type = MYSQL_TYPE_LONG;
+  param.buffer = &id;
+  MYSQL_BIND result_bind{};
+  result_bind.buffer_type = MYSQL_TYPE_LONG;
+  result_bind.buffer = &returned_id;
+  rc = mysql_stmt_bind_param(stmt, &param);
+  check_execute(stmt, rc);
+  rc = mysql_stmt_bind_result(stmt, &result_bind);
+  check_execute(stmt, rc);
+
+  rc = mysql_stmt_execute(stmt);
+  check_execute(stmt, rc);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == 0);
+  DIE_UNLESS(returned_id == 1);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == MYSQL_NO_DATA);
+  rc = mysql_stmt_free_result(stmt);
+  check_execute(stmt, rc);
+
+  const ulong cursor_type = CURSOR_TYPE_READ_ONLY;
+  rc = mysql_stmt_attr_set(stmt, STMT_ATTR_CURSOR_TYPE, &cursor_type);
+  check_execute(stmt, rc);
+  id = 2;
+  DIE_UNLESS(mysql_stmt_execute(stmt) != 0);
+  DIE_UNLESS(mysql_stmt_errno(stmt) == ER_WRONG_ARGUMENTS);
+  id = 999;
+  DIE_UNLESS(mysql_stmt_execute(stmt) != 0);
+  DIE_UNLESS(mysql_stmt_errno(stmt) == ER_WRONG_ARGUMENTS);
+
+  const ulong no_cursor = CURSOR_TYPE_NO_CURSOR;
+  rc = mysql_stmt_attr_set(stmt, STMT_ATTR_CURSOR_TYPE, &no_cursor);
+  check_execute(stmt, rc);
+  id = 2;
+  rc = mysql_stmt_execute(stmt);
+  check_execute(stmt, rc);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == 0);
+  DIE_UNLESS(returned_id == 2);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == MYSQL_NO_DATA);
+  rc = mysql_stmt_free_result(stmt);
+  check_execute(stmt, rc);
+
+  id = 999;
+  rc = mysql_stmt_execute(stmt);
+  check_execute(stmt, rc);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == MYSQL_NO_DATA);
+  mysql_stmt_close(stmt);
+  myquery(mysql_query(mysql, "DROP TABLE delete_returning_ps"));
+}
+
+/* WL#17356: DELETE RETURNING result types and automatic reprepare. */
+static void test_delete_returning_metadata_reprepare() {
+  myheader("test_delete_returning_metadata_reprepare");
+  int rc;
+  myquery(mysql_query(mysql,
+                      "CREATE TABLE delret_types (id INT PRIMARY KEY, n INT, "
+                      "txt VARCHAR(20), amount DECIMAL(6,2), f FLOAT)"));
+  myquery(
+      mysql_query(mysql,
+                  "INSERT INTO delret_types VALUES "
+                  "(1,NULL,'first',12.50,1.25),(2,NULL,'second',12.50,1.25)"));
+  MYSQL_STMT *stmt = mysql_simple_prepare(
+      mysql, "DELETE FROM delret_types WHERE id = ? RETURNING *");
+  check_stmt(stmt);
+  MYSQL_RES *metadata = mysql_stmt_result_metadata(stmt);
+  DIE_UNLESS(metadata != nullptr && mysql_num_fields(metadata) == 5);
+  MYSQL_FIELD *fields = mysql_fetch_fields(metadata);
+  const char *names[] = {"id", "n", "txt", "amount", "f"};
+  const enum_field_types types[] = {MYSQL_TYPE_LONG, MYSQL_TYPE_LONG,
+                                    MYSQL_TYPE_VAR_STRING,
+                                    MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_FLOAT};
+  for (uint i = 0; i < 5; ++i) {
+    DIE_UNLESS(strcmp(fields[i].name, names[i]) == 0);
+    DIE_UNLESS(fields[i].type == types[i]);
+  }
+  const ulong original_text_length = fields[2].length;
+  mysql_free_result(metadata);
+
+  int id = 1, returned_id = 0, nullable = 0;
+  char text[21]{}, decimal[16]{};
+  float real = 0;
+  bool is_null = false;
+  ulong text_length = 0, decimal_length = 0;
+  MYSQL_BIND param{};
+  param.buffer_type = MYSQL_TYPE_LONG;
+  param.buffer = &id;
+  rc = mysql_stmt_bind_param(stmt, &param);
+  check_execute(stmt, rc);
+  MYSQL_BIND outputs[5]{};
+  outputs[0].buffer_type = MYSQL_TYPE_LONG;
+  outputs[0].buffer = &returned_id;
+  outputs[1].buffer_type = MYSQL_TYPE_LONG;
+  outputs[1].buffer = &nullable;
+  outputs[1].is_null = &is_null;
+  outputs[2].buffer_type = MYSQL_TYPE_STRING;
+  outputs[2].buffer = text;
+  outputs[2].buffer_length = sizeof(text);
+  outputs[2].length = &text_length;
+  outputs[3].buffer_type = MYSQL_TYPE_STRING;
+  outputs[3].buffer = decimal;
+  outputs[3].buffer_length = sizeof(decimal);
+  outputs[3].length = &decimal_length;
+  outputs[4].buffer_type = MYSQL_TYPE_FLOAT;
+  outputs[4].buffer = &real;
+  rc = mysql_stmt_bind_result(stmt, outputs);
+  check_execute(stmt, rc);
+  rc = mysql_stmt_execute(stmt);
+  check_execute(stmt, rc);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == 0);
+  DIE_UNLESS(returned_id == 1 && is_null && real == 1.25f);
+  DIE_UNLESS(text_length == 5 && memcmp(text, "first", 5) == 0);
+  DIE_UNLESS(decimal_length == 5 && memcmp(decimal, "12.50", 5) == 0);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == MYSQL_NO_DATA);
+  rc = mysql_stmt_free_result(stmt);
+  check_execute(stmt, rc);
+
+  // Change result metadata while keeping the column count compatible with
+  // existing client bindings, and force automatic server-side reprepare.
+  myquery(
+      mysql_query(mysql, "ALTER TABLE delret_types MODIFY txt VARCHAR(40)"));
+  id = 2;
+  rc = mysql_stmt_execute(stmt);
+  check_execute(stmt, rc);
+  DIE_UNLESS(mysql_stmt_field_count(stmt) == 5);
+  metadata = mysql_stmt_result_metadata(stmt);
+  DIE_UNLESS(metadata != nullptr && mysql_num_fields(metadata) == 5);
+  fields = mysql_fetch_fields(metadata);
+  DIE_UNLESS(fields[2].length > original_text_length);
+  mysql_free_result(metadata);
+  rc = mysql_stmt_bind_result(stmt, outputs);
+  check_execute(stmt, rc);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == 0);
+  DIE_UNLESS(returned_id == 2 && is_null && real == 1.25f);
+  DIE_UNLESS(text_length == 6 && memcmp(text, "second", 6) == 0);
+  DIE_UNLESS(decimal_length == 5 && memcmp(decimal, "12.50", 5) == 0);
+  DIE_UNLESS(mysql_stmt_fetch(stmt) == MYSQL_NO_DATA);
+  mysql_stmt_close(stmt);
+  myquery(mysql_query(mysql, "DROP TABLE delret_types"));
+}
+
+/* WL#17356: DELETE RETURNING streamed errors and multiple results. */
+static void test_delete_returning_result_recovery() {
+  myheader("test_delete_returning_result_recovery");
+  myquery(mysql_query(mysql,
+                      "CREATE TABLE delret_recovery (id INT PRIMARY KEY) "
+                      "ENGINE=InnoDB"));
+  myquery(mysql_query(mysql, "INSERT INTO delret_recovery VALUES (1),(2)"));
+  myquery(mysql_query(mysql,
+                      "CREATE TRIGGER delret_reject BEFORE DELETE ON "
+                      "delret_recovery FOR EACH ROW BEGIN IF OLD.id = 2 THEN "
+                      "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='rejected'; "
+                      "END IF; END"));
+  // Unbuffered reading proves a row preceded the error packet.
+  myquery(mysql_query(mysql,
+                      "DELETE FROM delret_recovery ORDER BY id RETURNING id"));
+  MYSQL_RES *result = mysql_use_result(mysql);
+  DIE_UNLESS(result != nullptr);
+  MYSQL_ROW row = mysql_fetch_row(result);
+  DIE_UNLESS(row != nullptr && strcmp(row[0], "1") == 0);
+  DIE_UNLESS(mysql_fetch_row(result) == nullptr);
+  DIE_UNLESS(mysql_errno(mysql) == ER_SIGNAL_EXCEPTION);
+  mysql_free_result(result);
+  myquery(mysql_query(mysql, "SELECT COUNT(*) FROM delret_recovery"));
+  result = mysql_store_result(mysql);
+  DIE_UNLESS(result != nullptr);
+  row = mysql_fetch_row(result);
+  DIE_UNLESS(row != nullptr && strcmp(row[0], "2") == 0);
+  mysql_free_result(result);
+  myquery(mysql_query(mysql, "DROP TRIGGER delret_reject"));
+
+  myquery(mysql_query(mysql,
+                      "CREATE PROCEDURE delret_results() BEGIN "
+                      "DELETE FROM delret_recovery WHERE id=999 RETURNING id; "
+                      "SELECT 42 AS marker; END"));
+  myquery(mysql_query(mysql, "CALL delret_results()"));
+  result = mysql_store_result(mysql);
+  DIE_UNLESS(result != nullptr && mysql_num_fields(result) == 1);
+  DIE_UNLESS(mysql_num_rows(result) == 0);
+  mysql_free_result(result);
+  DIE_UNLESS(mysql_next_result(mysql) == 0);
+  result = mysql_store_result(mysql);
+  DIE_UNLESS(result != nullptr && mysql_num_fields(result) == 1);
+  row = mysql_fetch_row(result);
+  DIE_UNLESS(row != nullptr && strcmp(row[0], "42") == 0);
+  DIE_UNLESS(mysql_fetch_row(result) == nullptr);
+  mysql_free_result(result);
+  DIE_UNLESS(mysql_next_result(mysql) == 0);
+  DIE_UNLESS(mysql_field_count(mysql) == 0);
+  DIE_UNLESS(mysql_next_result(mysql) == -1);
+  myquery(mysql_query(mysql, "DROP PROCEDURE delret_results"));
+
+  myquery(
+      mysql_query(mysql,
+                  "CREATE PROCEDURE delret_results() BEGIN "
+                  "DELETE FROM delret_recovery WHERE id=999 RETURNING id; "
+                  "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='rejected'; END"));
+  myquery(mysql_query(mysql, "CALL delret_results()"));
+  result = mysql_store_result(mysql);
+  DIE_UNLESS(result != nullptr && mysql_num_rows(result) == 0);
+  mysql_free_result(result);
+  DIE_UNLESS(mysql_next_result(mysql) > 0);
+  DIE_UNLESS(mysql_errno(mysql) == ER_SIGNAL_EXCEPTION);
+  // A new command must work after consuming the procedure's error.
+  myquery(mysql_query(mysql, "DROP PROCEDURE delret_results"));
+  myquery(mysql_query(mysql, "DROP TABLE delret_recovery"));
+}
+
+/* WL#17356: Constant RETURNING checks invoker-view privileges at prepare. */
+static void test_delete_returning_view_privileges() {
+  myheader("test_delete_returning_view_privileges");
+  myquery(mysql_query(mysql, "CREATE DATABASE delret_ps_acl"));
+  myquery(mysql_query(mysql,
+                      "CREATE TABLE delret_ps_acl.t (id INT PRIMARY KEY) "
+                      "ENGINE=InnoDB"));
+  myquery(mysql_query(mysql, "INSERT INTO delret_ps_acl.t VALUES (1)"));
+  myquery(mysql_query(mysql,
+                      "CREATE SQL SECURITY INVOKER VIEW delret_ps_acl.v AS "
+                      "SELECT id FROM delret_ps_acl.t"));
+  myquery(mysql_query(mysql, "CREATE USER 'delret_ps_reader'@'localhost'"));
+  myquery(mysql_query(mysql,
+                      "GRANT SELECT, DELETE ON delret_ps_acl.v "
+                      "TO 'delret_ps_reader'@'localhost'"));
+  myquery(mysql_query(mysql,
+                      "GRANT DELETE ON delret_ps_acl.t "
+                      "TO 'delret_ps_reader'@'localhost'"));
+
+  MYSQL *limited = mysql_client_init(nullptr);
+  DIE_UNLESS(limited != nullptr);
+  DIE_UNLESS(mysql_real_connect(limited, opt_host, "delret_ps_reader", "",
+                                "delret_ps_acl", opt_port, opt_unix_socket, 0));
+  for (const char *query :
+       {"DELETE FROM v RETURNING 1", "DELETE FROM v WHERE FALSE RETURNING 1",
+        "DELETE FROM v LIMIT 0 RETURNING 1"}) {
+    MYSQL_STMT *stmt = mysql_stmt_init(limited);
+    DIE_UNLESS(stmt != nullptr);
+    DIE_UNLESS(mysql_stmt_prepare(stmt, query, strlen(query)) != 0);
+    DIE_UNLESS(mysql_stmt_errno(stmt) == ER_VIEW_INVALID);
+    mysql_stmt_close(stmt);
+  }
+
+  myquery(mysql_query(mysql,
+                      "GRANT SELECT ON delret_ps_acl.t "
+                      "TO 'delret_ps_reader'@'localhost'"));
+  MYSQL_STMT *stmt = mysql_simple_prepare(limited, "DELETE FROM v RETURNING 1");
+  check_stmt(stmt);
+  DIE_UNLESS(mysql_autocommit(limited, false) == 0);
+  const auto execute_and_rollback = [&]() {
+    const int rc = mysql_stmt_execute(stmt);
+    check_execute(stmt, rc);
+    DIE_UNLESS(mysql_stmt_store_result(stmt) == 0);
+    DIE_UNLESS(mysql_stmt_num_rows(stmt) == 1);
+    DIE_UNLESS(mysql_stmt_free_result(stmt) == 0);
+    DIE_UNLESS(mysql_rollback(limited) == 0);
+  };
+  execute_and_rollback();
+  myquery(mysql_query(mysql,
+                      "REVOKE SELECT ON delret_ps_acl.t "
+                      "FROM 'delret_ps_reader'@'localhost'"));
+  DIE_UNLESS(mysql_stmt_execute(stmt) != 0);
+  DIE_UNLESS(mysql_stmt_errno(stmt) == ER_VIEW_INVALID);
+  myquery(mysql_query(mysql,
+                      "GRANT SELECT ON delret_ps_acl.t "
+                      "TO 'delret_ps_reader'@'localhost'"));
+  execute_and_rollback();
+  mysql_stmt_close(stmt);
+  mysql_close(limited);
+  myquery(mysql_query(mysql, "DROP USER 'delret_ps_reader'@'localhost'"));
+  myquery(mysql_query(mysql, "DROP DATABASE delret_ps_acl"));
+}
+
 static struct my_tests_st my_tests[] = {
     {"test_temporal_param", test_temporal_param},
     {"disable_query_logs", disable_query_logs},
@@ -24579,6 +24873,14 @@ static struct my_tests_st my_tests[] = {
     {"test_bug37202066", test_bug37202066},
     {"test_bug37383098", test_bug37383098},
     {"test_bug36686351", test_bug36686351},
+    {"test_delete_returning_binary_prepare",
+     test_delete_returning_binary_prepare},
+    {"test_delete_returning_metadata_reprepare",
+     test_delete_returning_metadata_reprepare},
+    {"test_delete_returning_result_recovery",
+     test_delete_returning_result_recovery},
+    {"test_delete_returning_view_privileges",
+     test_delete_returning_view_privileges},
     {nullptr, nullptr}};
 
 static struct my_tests_st *get_my_tests() { return my_tests; }

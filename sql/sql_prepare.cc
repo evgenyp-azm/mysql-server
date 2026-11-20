@@ -1424,7 +1424,10 @@ bool Prepared_statement::prepare_query(THD *thd) {
   Query_result *result = nullptr;
   uint no_columns = 0;
 
-  if ((sql_command_flags[sql_command] & CF_HAS_RESULT_SET) &&
+  const bool has_returning =
+      sql_command == SQLCOM_DELETE &&
+      down_cast<Sql_cmd_dml *>(m_lex->m_sql_cmd)->has_returning();
+  if (((sql_command_flags[sql_command] & CF_HAS_RESULT_SET) || has_returning) &&
       !m_lex->is_explain()) {
     Query_expression *unit = m_lex->unit;
     result = unit->query_result();
@@ -3597,6 +3600,10 @@ bool Prepared_statement::execute(THD *thd, String *expanded_query,
   if (open_cursor) {
     // Only DML statements may have assigned a cursor.
     if (sql_cmd == nullptr) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0), "with cursor");
+      return true;
+    }
+    if (sql_cmd->has_returning() && !sql_cmd->may_use_cursor()) {
       my_error(ER_WRONG_ARGUMENTS, MYF(0), "with cursor");
       return true;
     }

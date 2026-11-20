@@ -1,0 +1,19 @@
+CREATE TABLE delret_metadata (id INT PRIMARY KEY) ENGINE=NDB;
+INSERT INTO delret_metadata VALUES (1), (2);
+SET @saved_debug = @@session.debug;
+SET SESSION debug = '+d,delete_returning_metadata_error';
+DELETE FROM delret_metadata WHERE id > 0 RETURNING id;
+ERROR HY000: Internal error: DELETE RETURNING metadata failure
+SET SESSION debug = @saved_debug;
+SELECT * FROM delret_metadata ORDER BY id;
+id
+1
+2
+DELETE FROM delret_metadata WHERE id > 0 RETURNING id;
+id
+1
+2
+SELECT COUNT(*) FROM delret_metadata;
+COUNT(*)
+0
+DROP TABLE delret_metadata;

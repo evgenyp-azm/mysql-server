@@ -1,0 +1,54 @@
+CREATE TABLE delret_engine (id INT PRIMARY KEY) ENGINE=NDB;
+INSERT INTO delret_engine
+WITH RECURSIVE seq(id) AS
+(SELECT 1 UNION ALL SELECT id+1 FROM seq WHERE id < 100)
+SELECT id FROM seq;
+DELETE FROM delret_engine WHERE id IN (1, 3, 999) RETURNING id;
+id
+1
+3
+SELECT COUNT(*) FROM delret_engine;
+COUNT(*)
+98
+DELETE FROM delret_engine WHERE id IN (998, 999) RETURNING id;
+id
+SELECT ROW_COUNT();
+ROW_COUNT()
+-1
+SELECT COUNT(*) FROM delret_engine;
+COUNT(*)
+98
+DROP TABLE delret_engine;
+# WL#17356: DELETE RETURNING with NDB cascades.
+CREATE TABLE delret_parent (id INT PRIMARY KEY) ENGINE=NDB;
+CREATE TABLE delret_child (id INT PRIMARY KEY, parent_id INT,
+FOREIGN KEY (parent_id) REFERENCES delret_parent(id) ON DELETE CASCADE)
+ENGINE=NDB;
+INSERT INTO delret_parent VALUES (1), (2);
+INSERT INTO delret_child VALUES (1, 1), (2, 2);
+DELETE FROM delret_parent WHERE id = 1
+RETURNING id, (SELECT COUNT(*) FROM delret_child) AS children;
+id	children
+1	<unspecified>
+SELECT COUNT(*) FROM delret_child;
+COUNT(*)
+1
+INSERT INTO delret_parent VALUES (1);
+INSERT INTO delret_child VALUES (1, 1);
+PREPARE stmt FROM 'DELETE FROM delret_parent ORDER BY id
+  RETURNING id, (SELECT COUNT(*) FROM delret_child) AS children';
+EXECUTE stmt;
+id	children
+1	<unspecified>
+2	<unspecified>
+INSERT INTO delret_parent VALUES (1), (2);
+INSERT INTO delret_child VALUES (1, 1), (2, 2);
+EXECUTE stmt;
+id	children
+1	<unspecified>
+2	<unspecified>
+DEALLOCATE PREPARE stmt;
+SELECT COUNT(*) FROM delret_child;
+COUNT(*)
+0
+DROP TABLE delret_child, delret_parent;

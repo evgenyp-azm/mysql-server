@@ -19,6 +19,35 @@ ERROR 0A000: Multiple object delete is not supported for JSON Duality Views.
 SELECT * FROM p_t2;
 f3	f4
 1	2
+# WL#17356: RETURNING is rejected for JSON duality views without deleting rows
+DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 1 RETURNING data;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+DELETE FROM p_dv1 RETURNING 1;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 999 RETURNING data;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+DELETE FROM p_dv1 WHERE FALSE RETURNING data;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+PREPARE delret_jdv FROM 'DELETE FROM p_dv1 RETURNING data';
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+SELECT * FROM p_t2;
+f3	f4
+1	2
+# WL#17356: Rejected JDV RETURNING must not cascade to child rows
+CREATE TABLE delret_jdv_child (parent_id INT,
+FOREIGN KEY (parent_id) REFERENCES p_t2(f3) ON DELETE CASCADE);
+INSERT INTO delret_jdv_child VALUES (1);
+DELETE FROM p_dv1 RETURNING data;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+SELECT COUNT(*) FROM p_t2;
+COUNT(*)
+1
+SELECT COUNT(*) FROM delret_jdv_child;
+COUNT(*)
+1
+DROP TABLE delret_jdv_child;
+DELETE FROM p_dv1 RETURNING data;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
 DROP TABLE p_t2;
 DROP VIEW p_dv1;
 ################################################################################
@@ -155,6 +184,14 @@ DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 100;
 SELECT * FROM p_dv1;
 data
 {"f2": 2, "_id": 1, "childN": [{"f11": 1, "f12": 2}], "_metadata": {"etag": "073a8c14e558c59d028bc2a64d9aad2d"}}
+DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 1 RETURNING data;
+ERROR 0A000: DELETE with RETURNING clause is not supported for JSON Duality Views.
+SELECT COUNT(*) FROM p_t1;
+COUNT(*)
+1
+SELECT COUNT(*) FROM p_t2;
+COUNT(*)
+1
 DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 1;
 SELECT * FROM p_dv1;
 data
