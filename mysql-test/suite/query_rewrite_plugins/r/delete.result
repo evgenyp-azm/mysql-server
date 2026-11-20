@@ -54,6 +54,54 @@ Note	1105	Query 'DELETE test.v2 FROM test.v2 WHERE test.v2.a = 1' rewritten to '
 DELETE FROM test.v1;
 Warnings:
 Note	1105	Query 'DELETE FROM test.v1' rewritten to 'DELETE FROM test.t2' by a query rewrite plugin
+INSERT INTO t2 VALUES (10, 20), (30, 40), (50, 60);
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement)
+VALUES ('DELETE FROM test.t2 WHERE a = ? RETURNING ? AS marker',
+'DELETE FROM test.t2 WHERE a = ? RETURNING ? + 1 AS marker');
+CALL query_rewrite.flush_rewrite_rules();
+DELETE FROM test.t2 WHERE a = 10 RETURNING 99 AS marker;
+marker
+100
+SELECT a FROM t2 ORDER BY a;
+a
+30
+50
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement)
+VALUES ('DELETE FROM test.t2 WHERE a = ? RETURNING ? AS x, ? AS y',
+'DELETE FROM test.t2 WHERE a = ? RETURNING ? + 10 AS x, ? + 20 AS y');
+CALL query_rewrite.flush_rewrite_rules();
+DELETE FROM test.t2 WHERE a = 30 RETURNING 1 AS x, 2 AS y;
+x	y
+11	22
+DELETE FROM test.t2 WHERE a = 50 RETURNING 1 AS x, 2 AS y, 3 AS z;
+x	y	z
+1	2	3
+SELECT a FROM t2;
+a
+CREATE TABLE delret_rewrite (id INT PRIMARY KEY, grp INT, priority INT);
+INSERT INTO delret_rewrite VALUES (1,10,1), (2,10,3), (3,10,2), (4,20,4);
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement)
+VALUES (
+'DELETE FROM test.delret_rewrite WHERE grp = ? ORDER BY ABS(priority - ?) LIMIT ? RETURNING id, ? AS marker',
+'DELETE FROM test.delret_rewrite WHERE grp = ? ORDER BY ABS(priority - ?) LIMIT ? RETURNING id, ? + 100 AS marker');
+CALL query_rewrite.flush_rewrite_rules();
+DELETE FROM test.delret_rewrite WHERE grp = 10
+ORDER BY ABS(priority - 3) LIMIT 2 RETURNING id, 7 AS marker;
+id	marker
+2	107
+3	107
+SELECT id FROM delret_rewrite ORDER BY id;
+id
+1
+4
+DELETE FROM test.delret_rewrite WHERE grp = 20
+ORDER BY ABS(priority - 5) LIMIT 1 RETURNING id, 9 AS marker;
+id	marker
+4	109
+SELECT id FROM delret_rewrite ORDER BY id;
+id
+1
+DROP TABLE delret_rewrite;
 DROP VIEW v1, v2;
 DROP TABLE t1, t2;
 Warnings:

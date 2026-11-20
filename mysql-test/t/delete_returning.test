@@ -1,5 +1,5 @@
 #
-# Tests for DELETE ... RETURNING
+# WL#17356: Tests for DELETE ... RETURNING
 #
 
 --echo #
@@ -23,6 +23,7 @@ CREATE TABLE t2c SELECT * FROM t2;
 --echo # Test 1: DELETE ... RETURNING *
 --echo #
 DELETE FROM t1 WHERE a=2 RETURNING *;
+SELECT ROW_COUNT();
 SELECT * FROM t1;
 INSERT INTO t1 VALUES (2,'BB'), (2,'bb');
 
@@ -50,6 +51,7 @@ INSERT INTO t1 VALUES (2,'BB'), (2,'bb');
 --echo # Test 5: DELETE ... RETURNING with no rows matching (empty result set)
 --echo #
 DELETE FROM t1 WHERE a=999 ORDER BY a RETURNING b;
+SELECT ROW_COUNT();
 SELECT * FROM t1;
 
 --echo #
@@ -386,6 +388,469 @@ INSERT INTO t1 SELECT * FROM t1c;
 --echo # Unknown name in ORDER BY is still an error
 --error ER_BAD_FIELD_ERROR
 DELETE FROM t1 WHERE a = 2 ORDER BY nosuch RETURNING a;
+
+--echo #
+--echo # Test 30: DELETE IGNORE returns only rows actually deleted
+--echo #
+CREATE TABLE delret_parent (id INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TABLE delret_child (parent_id INT,
+  FOREIGN KEY (parent_id) REFERENCES delret_parent(id)) ENGINE=InnoDB;
+INSERT INTO delret_parent VALUES (1), (2);
+INSERT INTO delret_child VALUES (1);
+# An ignored failure still consumes LIMIT, with or without RETURNING.
+DELETE IGNORE FROM delret_parent ORDER BY id LIMIT 1;
+SELECT id FROM delret_parent ORDER BY id;
+DELETE IGNORE FROM delret_parent ORDER BY id LIMIT 1 RETURNING id;
+SELECT id FROM delret_parent ORDER BY id;
+DELETE IGNORE FROM delret_parent ORDER BY id RETURNING id;
+SELECT id FROM delret_parent;
+DROP TABLE delret_child, delret_parent;
+
+--echo #
+--echo # Test 31: Result-set row count and diagnostics
+--echo #
+CREATE TABLE delret_count (id INT PRIMARY KEY);
+INSERT INTO delret_count VALUES (1), (2);
+DELETE FROM delret_count WHERE id = 1 RETURNING id;
+GET DIAGNOSTICS @delret_count = ROW_COUNT;
+SELECT @delret_count;
+DELETE FROM delret_count WHERE id = 999 RETURNING id;
+GET DIAGNOSTICS @delret_count = ROW_COUNT;
+SELECT @delret_count;
+DELETE FROM delret_count WHERE FALSE RETURNING id;
+GET DIAGNOSTICS @delret_count = ROW_COUNT;
+SELECT @delret_count;
+DELETE FROM delret_count LIMIT 0 RETURNING id;
+GET DIAGNOSTICS @delret_count = ROW_COUNT;
+SELECT @delret_count;
+DELETE FROM delret_count WHERE id = 2;
+SELECT ROW_COUNT();
+DELETE FROM delret_count RETURNING id;
+SELECT ROW_COUNT();
+DROP TABLE delret_count;
+
+--echo #
+--echo # Test 32: RETURNING subqueries over unchanged data
+--echo #
+CREATE TABLE delret_subquery_target (id INT PRIMARY KEY, value INT);
+CREATE TABLE delret_subquery_data (parent_id INT, seq INT,
+  PRIMARY KEY (parent_id, seq));
+INSERT INTO delret_subquery_target VALUES (1, NULL), (2, NULL);
+INSERT INTO delret_subquery_data VALUES (1, 1), (2, 1);
+CREATE VIEW delret_subquery_view AS
+  SELECT DISTINCT parent_id FROM delret_subquery_data;
+START TRANSACTION;
+# The helper data stays unchanged throughout each DELETE.
+DELETE FROM delret_subquery_target ORDER BY id
+  RETURNING id,
+    (SELECT COUNT(*) FROM delret_subquery_data) AS total,
+    EXISTS(SELECT * FROM delret_subquery_data) AS has_rows,
+    2 IN (SELECT parent_id FROM delret_subquery_data) AS has_second,
+    (SELECT MIN(parent_id) FROM delret_subquery_data) AS first_parent,
+    (SELECT MAX(parent_id) FROM delret_subquery_data) AS last_parent;
+ROLLBACK;
+START TRANSACTION;
+# A deterministic subquery remains a supported RETURNING sort key.
+DELETE FROM delret_subquery_target ORDER BY total, id
+  RETURNING id, (SELECT COUNT(*) FROM delret_subquery_data) AS total;
+ROLLBACK;
+PREPARE stmt FROM
+'DELETE FROM delret_subquery_target ORDER BY -id LIMIT 2
+ RETURNING id,
+   (SELECT COUNT(*) FROM delret_subquery_data) AS total,
+   (SELECT seq FROM delret_subquery_data
+    WHERE parent_id = 1 AND seq = 1) AS first_child,
+   (SELECT (SELECT COUNT(*) FROM delret_subquery_data)) AS nested_total,
+   (SELECT COUNT(*) FROM
+      (SELECT DISTINCT parent_id FROM delret_subquery_data) AS d) AS derived_total,
+   (WITH c AS (SELECT DISTINCT parent_id FROM delret_subquery_data)
+    SELECT COUNT(*) FROM c) AS cte_total,
+   (SELECT COUNT(*) FROM delret_subquery_view) AS view_total,
+   (SELECT COUNT(*) FROM delret_subquery_data UNION ALL SELECT 42
+    ORDER BY 1 LIMIT 1) AS union_total';
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+ALTER TABLE delret_subquery_data ADD COLUMN extra INT;
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+DEALLOCATE PREPARE stmt;
+START TRANSACTION;
+# Shared materialization must remain correct for unchanged input data.
+WITH c AS (SELECT DISTINCT parent_id FROM delret_subquery_data)
+DELETE FROM delret_subquery_target WHERE (SELECT COUNT(*) FROM c) = 2 ORDER BY id
+  RETURNING id, (SELECT COUNT(*) FROM c) AS total,
+    (SELECT COUNT(*) FROM c AS a JOIN c AS b USING (parent_id)) AS joined_total;
+ROLLBACK;
+START TRANSACTION;
+WITH RECURSIVE c(v) AS
+  (SELECT 1 UNION ALL SELECT v + 1 FROM c WHERE v < 2)
+DELETE FROM delret_subquery_target WHERE (SELECT COUNT(*) FROM c) = 2 ORDER BY id
+  RETURNING id, (SELECT COUNT(*) FROM c) AS total;
+ROLLBACK;
+CREATE ALGORITHM=MERGE VIEW delret_subquery_predicate AS
+  SELECT id, (SELECT COUNT(*) FROM delret_subquery_data) AS total,
+    NULL IN (SELECT parent_id FROM delret_subquery_data) AS null_in,
+    NULL NOT IN (SELECT parent_id FROM delret_subquery_data) AS null_not_in,
+    value IN (SELECT parent_id FROM delret_subquery_data) AS nullable_in,
+    value NOT IN (SELECT parent_id FROM delret_subquery_data) AS nullable_not_in,
+    (NULL, NULL) IN
+      (SELECT parent_id, seq FROM delret_subquery_data) AS row_in,
+    (NULL, NULL) NOT IN
+      (SELECT parent_id, seq FROM delret_subquery_data) AS row_not_in
+  FROM delret_subquery_target;
+CREATE ALGORITHM=MERGE VIEW delret_subquery_nested AS
+  SELECT * FROM delret_subquery_predicate;
+PREPARE stmt FROM
+  'DELETE FROM delret_subquery_nested ORDER BY id RETURNING *';
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+# Only change helper data between statements, then reuse the prepared DELETE.
+DELETE FROM delret_subquery_data;
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+ALTER TABLE delret_subquery_data ADD COLUMN predicate_extra INT;
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+DEALLOCATE PREPARE stmt;
+DROP VIEW delret_subquery_nested, delret_subquery_predicate, delret_subquery_view;
+DROP TABLE delret_subquery_data, delret_subquery_target;
+CREATE TABLE delret_cascade_parent (id INT PRIMARY KEY);
+CREATE TABLE delret_cascade_child (parent_id INT,
+  FOREIGN KEY (parent_id) REFERENCES delret_cascade_parent(id) ON DELETE CASCADE);
+INSERT INTO delret_cascade_parent VALUES (1), (2);
+INSERT INTO delret_cascade_child VALUES (1), (2);
+# Exercise reads of modified data without requiring a particular visibility.
+--replace_column 2 <unspecified>
+DELETE FROM delret_cascade_parent ORDER BY id
+  RETURNING id, (SELECT COUNT(*) FROM delret_cascade_child) AS children;
+SELECT COUNT(*) FROM delret_cascade_parent;
+SELECT COUNT(*) FROM delret_cascade_child;
+DROP TABLE delret_cascade_child, delret_cascade_parent;
+
+--echo # Test 33: ORDER BY a nonreturned column chooses the correct row
+CREATE TABLE delret_order (id INT PRIMARY KEY, priority INT);
+INSERT INTO delret_order VALUES (1, 20), (2, 10);
+DELETE FROM delret_order ORDER BY priority LIMIT 1 RETURNING id;
+SELECT * FROM delret_order;
+DROP TABLE delret_order;
+--echo # Test 34: Column privileges and execution-time privilege checks
+CREATE DATABASE delret_acl;
+CREATE TABLE delret_acl.delret_priv (id INT PRIMARY KEY, secret INT);
+INSERT INTO delret_acl.delret_priv VALUES (1, 10), (2, 20);
+CREATE USER 'delret_reader'@'localhost';
+GRANT DELETE, SELECT(id) ON delret_acl.delret_priv TO 'delret_reader'@'localhost';
+connect (delret_con, localhost, delret_reader,,delret_acl);
+SELECT CURRENT_USER();
+DELETE FROM delret_priv WHERE id = 1 RETURNING id;
+--error ER_COLUMNACCESS_DENIED_ERROR
+DELETE FROM delret_priv WHERE id = 2 RETURNING secret;
+PREPARE delret_stmt FROM 'DELETE FROM delret_priv WHERE id = 2 RETURNING id';
+connection default;
+REVOKE SELECT(id) ON delret_acl.delret_priv FROM 'delret_reader'@'localhost';
+connection delret_con;
+--error ER_TABLEACCESS_DENIED_ERROR
+EXECUTE delret_stmt;
+DEALLOCATE PREPARE delret_stmt;
+connection default;
+disconnect delret_con;
+SELECT * FROM delret_acl.delret_priv;
+DROP USER 'delret_reader'@'localhost';
+DROP DATABASE delret_acl;
+--echo # Test 35: Trigger failure after a returned row rolls back the statement
+CREATE TABLE delret_error (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO delret_error VALUES (1), (2);
+delimiter |;
+CREATE TRIGGER delret_guard BEFORE DELETE ON delret_error
+FOR EACH ROW BEGIN
+  IF OLD.id = 2 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'delete rejected';
+  END IF;
+END|
+delimiter ;|
+--error ER_SIGNAL_EXCEPTION
+DELETE FROM delret_error ORDER BY id RETURNING id;
+SELECT * FROM delret_error ORDER BY id;
+DROP TRIGGER delret_guard;
+--echo # A RETURNING-expression error also rolls back the deleted row
+CREATE TABLE delret_many (id INT);
+INSERT INTO delret_many VALUES (1), (2);
+--error ER_SUBQUERY_NO_1_ROW
+DELETE FROM delret_error WHERE id = 1 RETURNING (SELECT id FROM delret_many);
+SELECT * FROM delret_error ORDER BY id;
+--echo # Successful RETURNING participates in an explicit transaction
+START TRANSACTION;
+DELETE FROM delret_error WHERE id = 1 RETURNING id;
+ROLLBACK;
+SELECT * FROM delret_error ORDER BY id;
+DROP TABLE delret_many, delret_error;
+--echo # Test 36: DELETE trigger restrictions and returned values
+CREATE TABLE delret_trigger (id INT PRIMARY KEY, value INT);
+CREATE TABLE delret_audit (id INT);
+INSERT INTO delret_trigger VALUES (1, 42);
+CREATE TRIGGER delret_after AFTER DELETE ON delret_trigger
+FOR EACH ROW INSERT INTO delret_audit VALUES (OLD.id);
+--error ER_CANT_UPDATE_USED_TABLE_IN_SF_OR_TRG
+DELETE FROM delret_trigger WHERE id = 1
+RETURNING id, value,
+  (SELECT COUNT(*) FROM delret_audit WHERE id = delret_trigger.id) AS logged;
+SELECT * FROM delret_trigger;
+SELECT COUNT(*) FROM delret_audit;
+DROP TRIGGER delret_after;
+SET @delret_seen = 0;
+CREATE TRIGGER delret_after AFTER DELETE ON delret_trigger
+FOR EACH ROW SET @delret_seen = OLD.id;
+DELETE FROM delret_trigger WHERE id = 1
+RETURNING id, value, @delret_seen AS seen;
+SELECT @delret_seen;
+DROP TABLE delret_trigger, delret_audit;
+SET @delret_seen = NULL;
+--echo # Test 37: All partitions pruned still returns empty metadata
+CREATE TABLE delret_partition (id INT PRIMARY KEY)
+PARTITION BY RANGE (id) (PARTITION p0 VALUES LESS THAN (10),
+PARTITION p1 VALUES LESS THAN MAXVALUE);
+INSERT INTO delret_partition VALUES (1), (11);
+DELETE FROM delret_partition PARTITION (p0) WHERE id = 11 RETURNING id;
+SELECT ROW_COUNT();
+SELECT * FROM delret_partition ORDER BY id;
+# Reading a helper table defers pruning until execution. This must use the
+# second pruning exit and still send column metadata for the empty result.
+CREATE TABLE delret_prune_lookup (id INT PRIMARY KEY);
+INSERT INTO delret_prune_lookup VALUES (11);
+DELETE FROM delret_partition PARTITION (p0)
+WHERE id = (SELECT id FROM delret_prune_lookup) RETURNING id;
+GET DIAGNOSTICS @delret_pruned_count = ROW_COUNT;
+SELECT @delret_pruned_count;
+PREPARE stmt FROM 'DELETE FROM delret_partition PARTITION (p0) WHERE id = (SELECT id FROM delret_prune_lookup) RETURNING id';
+EXECUTE stmt;
+SELECT ROW_COUNT();
+# Reuse the prepared statement with a matching value, then prune it again.
+UPDATE delret_prune_lookup SET id = 1;
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+UPDATE delret_prune_lookup SET id = 11;
+EXECUTE stmt;
+SELECT ROW_COUNT();
+DEALLOCATE PREPARE stmt;
+SELECT * FROM delret_partition ORDER BY id;
+DROP TABLE delret_prune_lookup;
+DROP TABLE delret_partition;
+
+--echo # Test 38: ORDER BY cannot reuse a nondeterministic RETURNING expression
+CREATE TABLE delret_random (id INT PRIMARY KEY);
+INSERT INTO delret_random VALUES (1), (2), (3), (4), (5), (6);
+# Filesort does not preserve expression values for RETURNING. Reject references
+# that would evaluate the same nondeterministic expression a second time.
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY r RETURNING id, RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY r LIMIT 2 RETURNING id, RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY id, r RETURNING id, RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY 2 RETURNING id, RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY FLOOR(RAND(1)*1000)
+RETURNING id, FLOOR(RAND(1)*1000) AS r;
+# Aliases inside larger expressions are already rejected by name resolution.
+--error ER_BAD_FIELD_ERROR
+DELETE FROM delret_random ORDER BY r+1 RETURNING id, RAND(1) AS r;
+--error ER_BAD_FIELD_ERROR
+DELETE FROM delret_random ORDER BY (SELECT r) RETURNING id, RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY r RETURNING UUID() AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY r RETURNING (SELECT RAND(1)) AS r;
+# Reject during preparation, including statements that would delete no rows.
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random WHERE FALSE ORDER BY r RETURNING RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY r LIMIT 0 RETURNING RAND(1) AS r;
+--error ER_NOT_SUPPORTED_YET
+PREPARE stmt FROM 'DELETE FROM delret_random ORDER BY r RETURNING RAND(1) AS r';
+SELECT id FROM delret_random ORDER BY id;
+# Nondeterministic expressions remain supported when ORDER BY does not reuse
+# them. A deterministic RETURNING alias also remains a valid sort key.
+START TRANSACTION;
+DELETE FROM delret_random ORDER BY 2 LIMIT 1 RETURNING id, -id AS r;
+ROLLBACK;
+START TRANSACTION;
+DELETE FROM delret_random ORDER BY -id LIMIT 1 RETURNING -id AS r;
+ROLLBACK;
+PREPARE stmt FROM 'DELETE FROM delret_random ORDER BY r LIMIT 1 RETURNING -id AS r, RAND(1) IS NOT NULL AS random_value';
+EXECUTE stmt;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+DELETE FROM delret_random ORDER BY RAND(1) RETURNING id;
+--error ER_NOT_SUPPORTED_YET
+DELETE FROM delret_random ORDER BY r RETURNING RAND(1) AS r;
+DROP TABLE delret_random;
+
+--echo # Test 39: IN, NOT IN and EXISTS with NULL and empty subquery results
+CREATE TABLE delret_predicate (value INT);
+CREATE TABLE delret_predicate_target (id INT PRIMARY KEY);
+INSERT INTO delret_predicate VALUES (1), (NULL);
+INSERT INTO delret_predicate_target VALUES (1), (2);
+DELETE FROM delret_predicate_target ORDER BY id
+RETURNING id,
+  id IN (SELECT value FROM delret_predicate) AS in_result,
+  id NOT IN (SELECT value FROM delret_predicate) AS not_in_result,
+  EXISTS(SELECT * FROM delret_predicate WHERE value = id) AS exists_result,
+  NOT EXISTS(SELECT * FROM delret_predicate WHERE value = id) AS not_exists_result;
+# A NULL-only result is nonempty for EXISTS and unknown for IN and NOT IN.
+DELETE FROM delret_predicate WHERE value IS NOT NULL;
+INSERT INTO delret_predicate_target VALUES (3);
+DELETE FROM delret_predicate_target
+RETURNING id,
+  id IN (SELECT value FROM delret_predicate) AS in_result,
+  id NOT IN (SELECT value FROM delret_predicate) AS not_in_result,
+  EXISTS(SELECT * FROM delret_predicate) AS exists_result;
+# An empty result gives FALSE/TRUE for IN/NOT IN, even with a NULL left value.
+DELETE FROM delret_predicate;
+INSERT INTO delret_predicate_target VALUES (4);
+DELETE FROM delret_predicate_target
+RETURNING id,
+  id IN (SELECT value FROM delret_predicate) AS in_result,
+  id NOT IN (SELECT value FROM delret_predicate) AS not_in_result,
+  NULL IN (SELECT value FROM delret_predicate) AS null_in_result,
+  NULL NOT IN (SELECT value FROM delret_predicate) AS null_not_in_result,
+  EXISTS(SELECT * FROM delret_predicate) AS exists_result;
+DROP TABLE delret_predicate_target, delret_predicate;
+
+--echo # Test 40: Full-text predicates are initialized before sorting
+CREATE TABLE delret_fulltext (
+  id INT PRIMARY KEY, body TEXT, FULLTEXT (body));
+INSERT INTO delret_fulltext VALUES
+  (1, 'ordinary alpha'), (2, 'needle alpha'),
+  (3, 'ordinary beta'), (4, 'needle beta'),
+  (5, 'ordinary gamma'), (6, 'ordinary delta');
+# The expression in ORDER BY forces filesort. Only matching rows may be
+# selected by its filter, returned, and deleted.
+SELECT id FROM delret_fulltext
+WHERE MATCH(body) AGAINST('needle') ORDER BY -id;
+START TRANSACTION;
+DELETE FROM delret_fulltext
+WHERE MATCH(body) AGAINST('needle') ORDER BY -id
+RETURNING id, MATCH(body) AGAINST('needle') > 0 AS matched;
+SELECT id FROM delret_fulltext ORDER BY id;
+ROLLBACK;
+# MATCH can also be evaluated as a sort key before the delete loop.
+START TRANSACTION;
+DELETE FROM delret_fulltext
+ORDER BY MATCH(body) AGAINST('needle') DESC, id LIMIT 2
+RETURNING id, MATCH(body) AGAINST('needle') > 0 AS matched;
+ROLLBACK;
+# Ordinary DELETE uses the same initialization in the single-table path.
+START TRANSACTION;
+DELETE FROM delret_fulltext
+WHERE MATCH(body) AGAINST('needle') ORDER BY -id;
+SELECT id FROM delret_fulltext ORDER BY id;
+ROLLBACK;
+# Repeated prepared execution must initialize Boolean searches each time.
+PREPARE stmt FROM 'DELETE FROM delret_fulltext WHERE MATCH(body) AGAINST("+needle" IN BOOLEAN MODE) ORDER BY -id LIMIT 1 RETURNING id';
+START TRANSACTION;
+EXECUTE stmt;
+EXECUTE stmt;
+SELECT id FROM delret_fulltext ORDER BY id;
+ROLLBACK;
+DEALLOCATE PREPARE stmt;
+# No matches must produce an empty result without deleting any rows.
+DELETE FROM delret_fulltext
+WHERE MATCH(body) AGAINST('absent') ORDER BY -id RETURNING id;
+SELECT COUNT(*) FROM delret_fulltext;
+# Also cover filtering without filesort and MATCH used only in RETURNING.
+DELETE FROM delret_fulltext
+WHERE id = 2 AND MATCH(body) AGAINST('needle') RETURNING id;
+DELETE FROM delret_fulltext ORDER BY -id LIMIT 1
+RETURNING id, MATCH(body) AGAINST('needle') > 0 AS matched;
+SELECT id FROM delret_fulltext ORDER BY id;
+DROP TABLE delret_fulltext;
+
+--echo # Test 41: View privileges for constant RETURNING expressions
+CREATE DATABASE delret_view_acl;
+CREATE TABLE delret_view_acl.t (id INT PRIMARY KEY);
+INSERT INTO delret_view_acl.t VALUES (1);
+CREATE SQL SECURITY INVOKER VIEW delret_view_acl.v AS
+  SELECT id FROM delret_view_acl.t;
+CREATE SQL SECURITY DEFINER VIEW delret_view_acl.v_def AS
+  SELECT id FROM delret_view_acl.t;
+CREATE USER 'delret_view_reader'@'localhost';
+GRANT SELECT, DELETE ON delret_view_acl.v TO 'delret_view_reader'@'localhost';
+GRANT SELECT, DELETE ON delret_view_acl.v_def TO 'delret_view_reader'@'localhost';
+GRANT DELETE ON delret_view_acl.t TO 'delret_view_reader'@'localhost';
+connect (delret_view_con, localhost, delret_view_reader,,delret_view_acl);
+connection delret_view_con;
+# Ordinary DELETE needs no additional SELECT privilege on the base table.
+START TRANSACTION;
+DELETE FROM v;
+ROLLBACK;
+# A constant list must not bypass the view's base-table SELECT check.
+--error ER_VIEW_INVALID
+DELETE FROM v RETURNING 1;
+--error ER_VIEW_INVALID
+DELETE FROM v WHERE FALSE RETURNING 1;
+--error ER_VIEW_INVALID
+DELETE FROM v LIMIT 0 RETURNING 1;
+--error ER_VIEW_INVALID
+PREPARE stmt FROM 'DELETE FROM v RETURNING 1';
+--error ER_VIEW_INVALID
+PREPARE stmt FROM 'DELETE FROM v WHERE FALSE RETURNING 1';
+--error ER_VIEW_INVALID
+PREPARE stmt FROM 'DELETE FROM v LIMIT 0 RETURNING 1';
+# DEFINER views use the definer's privileges for the base table.
+START TRANSACTION;
+DELETE FROM v_def RETURNING 1;
+ROLLBACK;
+PREPARE stmt FROM 'DELETE FROM v_def RETURNING 1';
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+DEALLOCATE PREPARE stmt;
+connection default;
+GRANT SELECT ON delret_view_acl.t TO 'delret_view_reader'@'localhost';
+connection delret_view_con;
+START TRANSACTION;
+DELETE FROM v RETURNING 1;
+ROLLBACK;
+PREPARE stmt FROM 'DELETE FROM v RETURNING 1';
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+# Privileges must be checked again when an existing statement is executed.
+connection default;
+REVOKE SELECT ON delret_view_acl.t FROM 'delret_view_reader'@'localhost';
+connection delret_view_con;
+--error ER_VIEW_INVALID
+EXECUTE stmt;
+--error ER_VIEW_INVALID
+DELETE FROM v RETURNING 1;
+connection default;
+GRANT SELECT(id) ON delret_view_acl.t TO 'delret_view_reader'@'localhost';
+connection delret_view_con;
+# Column-level SELECT also permits reading the single-column view.
+START TRANSACTION;
+EXECUTE stmt;
+ROLLBACK;
+START TRANSACTION;
+DELETE FROM v RETURNING 1;
+ROLLBACK;
+DEALLOCATE PREPARE stmt;
+connection default;
+disconnect delret_view_con;
+SELECT * FROM delret_view_acl.t;
+DROP USER 'delret_view_reader'@'localhost';
+DROP DATABASE delret_view_acl;
 
 --echo #
 --echo # Cleanup

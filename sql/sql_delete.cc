@@ -54,6 +54,7 @@
 #include "sql/iterators/row_iterator.h"
 #include "sql/join_optimizer/access_path.h"
 #include "sql/join_optimizer/bit_utils.h"
+#include "sql/join_optimizer/cost_model.h"
 #include "sql/join_optimizer/walk_access_paths.h"
 #include "sql/json_duality_view/dml.h"  // jdv_delete
 #include "sql/key_spec.h"
@@ -69,6 +70,7 @@
 #include "sql/range_optimizer/partition_pruning.h"
 #include "sql/range_optimizer/path_helpers.h"
 #include "sql/range_optimizer/range_optimizer.h"
+#include "sql/select_lex_visitor.h"
 #include "sql/sql_base.h"  // update_non_unique_table_error
 #include "sql/sql_bitmap.h"
 #include "sql/sql_class.h"
@@ -204,6 +206,10 @@ bool Sql_cmd_delete::check_privileges(THD *thd) {
 
 bool Sql_cmd_delete::send_returning_metadata(THD *thd) {
   assert(m_returning);
+  DBUG_EXECUTE_IF("delete_returning_metadata_error", {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "DELETE RETURNING metadata failure");
+    return true;
+  });
   return result->send_result_set_metadata(
       thd, lex->query_block->fields,
       Protocol::SEND_NUM_ROWS | Protocol::SEND_EOF);
@@ -450,6 +456,15 @@ bool Sql_cmd_delete::delete_from_single_table(THD *thd) {
   /* Update the table->file->stats.records number */
   table->file->info(HA_STATUS_VARIABLE | HA_STATUS_NO_LOCK);
 
+  if (lex->using_hypergraph_optimizer()) {
+    // RETURNING uses single-table DELETE without join planning. Cache the row
+    // size normally initialized by MakeJoinHypergraph for range scan costing.
+    auto *bytes_per_row =
+        new (thd->mem_root) BytesPerTableRow{EstimateBytesPerRowTable(table)};
+    if (bytes_per_row == nullptr) return true;
+    table->set_bytes_per_row(bytes_per_row);
+  }
+
   table->covering_keys.clear_all();
 
   if (*conds != nullptr &&
@@ -562,6 +577,10 @@ bool Sql_cmd_delete::delete_from_single_table(THD *thd) {
                                     /*count_examined_rows=*/false);
     }
 
+    // Initialize MATCH before filesort evaluates WHERE.
+    if (query_block->has_ft_funcs() && init_ftfuncs(thd, query_block))
+      return true; /* purecov: inspected */
+
     unique_ptr_destroy_only<RowIterator> iterator;
     if (need_sort) {
       assert(usable_index == MAX_KEY);
@@ -598,10 +617,11 @@ bool Sql_cmd_delete::delete_from_single_table(THD *thd) {
       if (iterator->Init()) return true;
     }
 
-    if (query_block->has_ft_funcs() && init_ftfuncs(thd, query_block))
-      return true; /* purecov: inspected */
-
     THD_STAGE_INFO(thd, stage_updating);
+
+    // Send metadata before starting bulk deletion, so a send failure cannot
+    // leave bulk-delete state active.
+    if (m_returning && send_returning_metadata(thd)) return true;
 
     if (has_after_triggers) {
       /*
@@ -622,9 +642,6 @@ bool Sql_cmd_delete::delete_from_single_table(THD *thd) {
         !using_limit && !has_delete_triggers && range_scan && !m_returning &&
         used_index(range_scan) != MAX_KEY)
       read_removal = table->check_read_removal(used_index(range_scan));
-
-    // Send result set metadata for RETURNING before the delete loop
-    if (m_returning && send_returning_metadata(thd)) return true;
 
     assert(limit > 0);
 
@@ -649,6 +666,7 @@ bool Sql_cmd_delete::delete_from_single_table(THD *thd) {
 
       assert(!thd->is_error());
 
+      const ha_rows deleted_before = deleted_rows;
       if (table_list->is_json_duality_view()) {
         if (deleted_rows != 0 ||
             table_list->field_translation->item == nullptr) {
@@ -682,7 +700,7 @@ bool Sql_cmd_delete::delete_from_single_table(THD *thd) {
       // This runs after AFTER DELETE triggers, but record[0] is unchanged:
       // DELETE triggers only have OLD.* (read-only), no NEW.*, so the
       // trigger cannot modify record[0].
-      if (m_returning) {
+      if (m_returning && deleted_rows != deleted_before) {
         if (result->send_data(thd, query_block->fields)) {
           error = 1;
           break;
@@ -807,7 +825,17 @@ bool Sql_cmd_delete::prepare_inner(THD *thd) {
   if (select->derived_table_count || select->table_func_count) {
     if (select->resolve_placeholder_tables(thd, apply_semijoin)) return true;
 
-    if (select->check_view_privileges(thd, DELETE_ACL, SELECT_ACL)) return true;
+    if (select->check_view_privileges(
+            thd, m_returning ? DELETE_ACL | SELECT_ACL : DELETE_ACL,
+            SELECT_ACL))
+      return true;
+  }
+
+  // Reject before JDV preparation or any RETURNING expression is evaluated.
+  if (m_returning && table_list->is_json_duality_view()) {
+    my_error(ER_JDV_OPERATION_NOT_SUPPORTED, MYF(0),
+             "DELETE with RETURNING clause");
+    return true;
   }
 
   if (table_list->is_json_duality_view() &&
@@ -966,6 +994,20 @@ bool Sql_cmd_delete::prepare_inner(THD *thd) {
     if (setup_order(thd, select->base_ref_items, &tables, &select->fields,
                     select->order_list.first))
       return true;
+
+    if (m_returning) {
+      // DELETE filesort stores row IDs, not expression values. A referenced
+      // nondeterministic RETURNING expression would be evaluated again after
+      // deletion and could return a different value from the sort key.
+      for (ORDER *order = select->order_list.first; order;
+           order = order->next) {
+        if (order->in_field_list && (*order->item)->is_non_deterministic()) {
+          my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                   "ORDER BY a nondeterministic RETURNING expression");
+          return true;
+        }
+      }
+    }
   }
 
   thd->want_privilege = want_privilege_saved;
@@ -1391,7 +1433,25 @@ int DeleteRowsIterator::DoRead() {
 }
 
 bool Sql_cmd_delete::accept(THD *thd, Select_lex_visitor *visitor) {
-  return thd->lex->unit->accept(visitor);
+  // The SELECT visitor visits fields first. RETURNING must instead follow
+  // WHERE/ORDER BY/LIMIT to preserve parameter order for query rewriting.
+  if (!m_returning) return thd->lex->unit->accept(visitor);
+
+  Query_block *const select = thd->lex->query_block;
+  if (select->has_tables() &&
+      accept_for_join(select->m_current_table_nest, visitor))
+    return true;
+  if (walk_item(select->where_cond(), visitor) ||
+      accept_for_order(select->order_list, visitor))
+    return true;
+  if (select->has_limit() && (walk_item(select->offset_limit, visitor) ||
+                              walk_item(select->select_limit, visitor)))
+    return true;
+  for (Item *item : select->visible_fields()) {
+    if (walk_item(item, visitor)) return true;
+  }
+  // Match the query-block and enclosing query-expression callbacks in accept().
+  return visitor->visit(select) || visitor->visit(thd->lex->unit);
 }
 
 table_map GetImmediateDeleteTables(const JOIN *join, table_map delete_tables) {

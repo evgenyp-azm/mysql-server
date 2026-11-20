@@ -28,6 +28,33 @@ DELETE p_dv1, p_t2 FROM p_dv1 INNER JOIN p_t2;
 DELETE FROM p_dv1;
 SELECT * FROM p_t2;
 
+--echo # WL#17356: RETURNING is rejected for JSON duality views without deleting rows
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 1 RETURNING data;
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 RETURNING 1;
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 999 RETURNING data;
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 WHERE FALSE RETURNING data;
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+PREPARE delret_jdv FROM 'DELETE FROM p_dv1 RETURNING data';
+SELECT * FROM p_t2;
+
+--echo # WL#17356: Rejected JDV RETURNING must not cascade to child rows
+CREATE TABLE delret_jdv_child (parent_id INT,
+  FOREIGN KEY (parent_id) REFERENCES p_t2(f3) ON DELETE CASCADE);
+INSERT INTO delret_jdv_child VALUES (1);
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 RETURNING data;
+SELECT COUNT(*) FROM p_t2;
+SELECT COUNT(*) FROM delret_jdv_child;
+DROP TABLE delret_jdv_child;
+--enable_ps_protocol
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 RETURNING data;
+--disable_ps_protocol
+
 DROP TABLE p_t2;
 DROP VIEW p_dv1;
 
@@ -167,6 +194,11 @@ SELECT * FROM p_dv1;
 DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 100;
 SELECT * FROM p_dv1;
 
+# WL#17356: Rejected JDV RETURNING preserves the root and nested documents.
+--error ER_JDV_OPERATION_NOT_SUPPORTED
+DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 1 RETURNING data;
+SELECT COUNT(*) FROM p_t1;
+SELECT COUNT(*) FROM p_t2;
 DELETE FROM p_dv1 WHERE json_value(data, '$._id') = 1;
 SELECT * FROM p_dv1;
 

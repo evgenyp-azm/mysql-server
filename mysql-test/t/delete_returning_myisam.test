@@ -1,0 +1,31 @@
+# WL#17356: DELETE RETURNING bypasses the MyISAM delete-all-rows optimization.
+--source include/have_myisam.inc
+SET @delret_log_bin = @@session.sql_log_bin;
+SET SESSION sql_log_bin = 0;
+CREATE TABLE delret_engine (id INT PRIMARY KEY) ENGINE=MyISAM;
+INSERT INTO delret_engine VALUES (1), (2), (3);
+--sorted_result
+DELETE FROM delret_engine RETURNING id;
+SELECT COUNT(*) FROM delret_engine;
+DROP TABLE delret_engine;
+--echo # Full-text predicates must be initialized before filesort.
+CREATE TABLE delret_fulltext (
+  id INT PRIMARY KEY, body TEXT, FULLTEXT (body)) ENGINE=MyISAM;
+INSERT INTO delret_fulltext VALUES
+  (1, 'ordinary alpha'), (2, 'needle alpha'),
+  (3, 'ordinary beta'), (4, 'needle beta'),
+  (5, 'ordinary gamma'), (6, 'ordinary delta');
+DELETE FROM delret_fulltext
+WHERE MATCH(body) AGAINST('absent') ORDER BY -id RETURNING id;
+SELECT COUNT(*) FROM delret_fulltext;
+DELETE FROM delret_fulltext
+WHERE MATCH(body) AGAINST('needle') ORDER BY -id
+RETURNING id, MATCH(body) AGAINST('needle') > 0 AS matched;
+SELECT id FROM delret_fulltext ORDER BY id;
+PREPARE stmt FROM 'DELETE FROM delret_fulltext WHERE MATCH(body) AGAINST("+ordinary" IN BOOLEAN MODE) ORDER BY -id LIMIT 1 RETURNING id';
+EXECUTE stmt;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+SELECT id FROM delret_fulltext ORDER BY id;
+DROP TABLE delret_fulltext;
+SET SESSION sql_log_bin = @delret_log_bin;

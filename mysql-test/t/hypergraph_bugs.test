@@ -3316,4 +3316,30 @@ SELECT 1 WHERE EXISTS (
 DROP TABLE t_small;
 DROP TABLE t_union;
 
+--echo #
+--echo # WL#17356: DELETE RETURNING range costing without join planning
+--echo #
+
+# RETURNING uses single-table DELETE even with hypergraph enabled. Both primary
+# and secondary index range costs need the row-size estimate normally cached
+# during join planning. Include wide rows and reprepare after a metadata change.
+CREATE TABLE delret_range (id INT PRIMARY KEY, grp INT, payload VARCHAR(4096),
+                           KEY (grp));
+INSERT INTO delret_range VALUES (1,10,'one'), (2,20,'two'), (3,30,'three'),
+                               (4,40,'four'), (5,50,'five');
+DELETE FROM delret_range WHERE id = 1 RETURNING id, grp;
+PREPARE delret_ps FROM
+  'DELETE FROM delret_range WHERE id = ? RETURNING id, LENGTH(payload) AS len';
+SET @delret_id = 2;
+EXECUTE delret_ps USING @delret_id;
+ALTER TABLE delret_range MODIFY payload VARCHAR(8192);
+SET @delret_id = 3;
+EXECUTE delret_ps USING @delret_id;
+DEALLOCATE PREPARE delret_ps;
+--sorted_result
+DELETE FROM delret_range WHERE grp >= 40 RETURNING id, LENGTH(payload) AS len;
+SELECT COUNT(*) FROM delret_range;
+DROP TABLE delret_range;
+SET @delret_id = NULL;
+
 --source include/disable_hypergraph.inc

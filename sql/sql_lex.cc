@@ -64,6 +64,7 @@
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"  // THD
 #include "sql/sql_cmd.h"
+#include "sql/sql_delete.h"  // Sql_cmd_delete
 #include "sql/sql_digest_stream.h"
 #include "sql/sql_error.h"
 #include "sql/sql_insert.h"  // Sql_cmd_insert_base
@@ -3195,6 +3196,10 @@ void Query_block::print_delete(const THD *thd, String *str,
     print_where_cond(thd, str, query_type);
     print_order_by(thd, str, query_type);
     print_limit(thd, str, query_type);
+    if (down_cast<Sql_cmd_delete *>(parent_lex->m_sql_cmd)->has_returning()) {
+      str->append(STRING_WITH_LEN(" returning "));
+      print_item_list(thd, str, query_type);
+    }
   } else {
     // Multi table delete
     print_table_references(thd, str, parent_lex->query_tables, query_type);

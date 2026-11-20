@@ -1,0 +1,14 @@
+# WL#17356: Metadata-send failure must leave the table usable and unchanged.
+--source include/have_debug.inc
+CREATE TABLE delret_metadata (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO delret_metadata VALUES (1), (2);
+SET @saved_debug = @@session.debug;
+SET SESSION debug = '+d,delete_returning_metadata_error';
+--error ER_INTERNAL_ERROR
+DELETE FROM delret_metadata WHERE id > 0 RETURNING id;
+SET SESSION debug = @saved_debug;
+SELECT * FROM delret_metadata ORDER BY id;
+--sorted_result
+DELETE FROM delret_metadata WHERE id > 0 RETURNING id;
+SELECT COUNT(*) FROM delret_metadata;
+DROP TABLE delret_metadata;

@@ -1,0 +1,28 @@
+# WL#17356: DELETE RETURNING with STATEMENT source logging.
+--source include/have_binlog_format_statement.inc
+--source include/not_group_replication_plugin.inc
+# The Change Stream Applier requires row-format events.
+--source include/have_mta.inc
+--source include/rpl/init_source_replica.inc
+--connection master
+--disable_warnings
+SET SESSION binlog_format = 'STATEMENT';
+--enable_warnings
+CREATE TABLE delret_rpl (id INT PRIMARY KEY) ENGINE=InnoDB;
+INSERT INTO delret_rpl VALUES (1), (2), (3);
+DELETE FROM delret_rpl WHERE id = 1 RETURNING id;
+SELECT * FROM delret_rpl ORDER BY id;
+--source include/rpl/sync_to_replica.inc
+SELECT * FROM delret_rpl ORDER BY id;
+--connection master
+START TRANSACTION;
+DELETE FROM delret_rpl WHERE id = 2 RETURNING id;
+ROLLBACK;
+DELETE FROM delret_rpl WHERE id = 999 RETURNING id;
+INSERT INTO delret_rpl VALUES (4);
+--source include/rpl/sync_to_replica.inc
+SELECT * FROM delret_rpl ORDER BY id;
+--connection master
+DROP TABLE delret_rpl;
+--source include/rpl/sync_to_replica.inc
+--source include/rpl/deinit.inc

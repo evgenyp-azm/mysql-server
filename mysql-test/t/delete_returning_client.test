@@ -1,0 +1,3 @@
+# WL#17356: Run RETURNING protocol tests independently of the full C API harness.
+--exec $MYSQL_CLIENT_TEST --getopt-ll-test=25600M --host=127.0.0.1 test_delete_returning_binary_prepare test_delete_returning_metadata_reprepare test_delete_returning_result_recovery test_delete_returning_view_privileges > $MYSQLTEST_VARDIR/log/delete_returning_client.out.log 2>&1
+--echo # WL#17356: DELETE RETURNING C API tests passed

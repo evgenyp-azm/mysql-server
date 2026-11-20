@@ -53,6 +53,56 @@ DELETE test.v2 FROM test.v2 WHERE test.v2.a = 1;
 # Replace view with a table.
 DELETE FROM test.v1;
 
+# WL#17356: RETURNING parameters follow WHERE parameters in source SQL order.
+# The WHERE value must stay 10; the RETURNING value must become 100.
+# Changing the returned value confirms that the rewrite was applied.
+INSERT INTO t2 VALUES (10, 20), (30, 40), (50, 60);
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement)
+VALUES ('DELETE FROM test.t2 WHERE a = ? RETURNING ? AS marker',
+        'DELETE FROM test.t2 WHERE a = ? RETURNING ? + 1 AS marker');
+CALL query_rewrite.flush_rewrite_rules();
+# Hide the rewrite note, but keep the query and returned value in the result.
+--disable_warnings
+DELETE FROM test.t2 WHERE a = 10 RETURNING 99 AS marker;
+--enable_warnings
+SELECT a FROM t2 ORDER BY a;
+# WL#17356: Rewrite multiple RETURNING expressions in source SQL order.
+# Expect 11,22. Distinct offsets expose swapped RETURNING parameters.
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement)
+VALUES ('DELETE FROM test.t2 WHERE a = ? RETURNING ? AS x, ? AS y',
+        'DELETE FROM test.t2 WHERE a = ? RETURNING ? + 10 AS x, ? + 20 AS y');
+CALL query_rewrite.flush_rewrite_rules();
+--disable_warnings
+DELETE FROM test.t2 WHERE a = 30 RETURNING 1 AS x, 2 AS y;
+--enable_warnings
+# WL#17356: A two-column RETURNING rule must not match three columns.
+# The unchanged values 1,2,3 confirm that neither rule matched this statement.
+DELETE FROM test.t2 WHERE a = 50 RETURNING 1 AS x, 2 AS y, 3 AS z;
+# The table is empty only if all three WHERE values were preserved.
+SELECT a FROM t2;
+
+# WL#17356: ORDER BY and LIMIT parameters precede RETURNING parameters.
+# Values 10,3,2,7 must select IDs 2,3 and return marker 107 after rewriting.
+CREATE TABLE delret_rewrite (id INT PRIMARY KEY, grp INT, priority INT);
+INSERT INTO delret_rewrite VALUES (1,10,1), (2,10,3), (3,10,2), (4,20,4);
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement)
+VALUES (
+  'DELETE FROM test.delret_rewrite WHERE grp = ? ORDER BY ABS(priority - ?) LIMIT ? RETURNING id, ? AS marker',
+  'DELETE FROM test.delret_rewrite WHERE grp = ? ORDER BY ABS(priority - ?) LIMIT ? RETURNING id, ? + 100 AS marker');
+CALL query_rewrite.flush_rewrite_rules();
+--disable_warnings
+DELETE FROM test.delret_rewrite WHERE grp = 10
+ORDER BY ABS(priority - 3) LIMIT 2 RETURNING id, 7 AS marker;
+--enable_warnings
+SELECT id FROM delret_rewrite ORDER BY id;
+# The same rule must bind a different WHERE, sort value, limit and marker.
+--disable_warnings
+DELETE FROM test.delret_rewrite WHERE grp = 20
+ORDER BY ABS(priority - 5) LIMIT 1 RETURNING id, 9 AS marker;
+--enable_warnings
+SELECT id FROM delret_rewrite ORDER BY id;
+DROP TABLE delret_rewrite;
+
 DROP VIEW v1, v2;
 DROP TABLE t1, t2;
 
